@@ -1,4 +1,4 @@
-use std::{cmp::min, thread};
+use std::{collections::BTreeMap, sync::mpsc, thread};
 
 // Potential improvement: instead measure how long first item takes and
 // spawn multiple threads if F takes longer than, for example, 50ms
@@ -59,27 +59,47 @@ impl ParallelMapper {
             return Ok(items.into_iter().map(f).collect());
         }
 
-        let item_count = items.len();
-        let work_chunks = chunks(items, item_count / self.concurrency);
+        // since channels can mess up ordering, send item idx along the way,
+        // so we can later get return results using BTreeMap
+        let (results_tx, results_rx) = mpsc::channel::<(usize, R)>();
 
-        let handles: Vec<_> = work_chunks
-            .into_iter()
-            .map(|chunk| {
+        // 1. spawn workers
+        let senders: Vec<_> = (0..self.concurrency)
+            .map(|_| {
                 let f = f.clone();
-                thread::spawn(move || chunk.into_iter().map(f).collect::<Vec<R>>())
+                let results_tx = results_tx.clone();
+                let (tx, rx) = mpsc::channel::<(usize, T)>();
+
+                // threads are detached since we will rely on channels to control flow
+                thread::spawn(move || {
+                    for (i, t) in rx.iter() {
+                        let r = f(t);
+                        results_tx.send((i, r)).unwrap();
+                    }
+                    // results_tx dropped here, once all senders are dropped, main thread can proceed
+                });
+
+                tx
             })
             .collect();
 
-        let mut results = Vec::with_capacity(item_count);
-
-        for handle in handles {
-            match handle.join() {
-                Err(_) => return Err(ParallelError::UnableToJoin),
-                Ok(chunk) => results.extend(chunk),
-            }
+        // 2. send actual work
+        for (idx, item) in items.into_iter().enumerate() {
+            senders[idx % self.concurrency].send((idx, item)).unwrap();
         }
 
-        Ok(results)
+        // drop all senders so worker threads will exit and main thread could continue
+        drop(results_tx);
+        drop(senders);
+
+        // 3. collect results and returned them in sorted order
+        let mut results = BTreeMap::new();
+
+        for (i, r) in results_rx.iter() {
+            results.insert(i, r);
+        }
+
+        Ok(results.into_values().collect())
     }
 }
 
@@ -93,20 +113,10 @@ where
     ParallelMapper::new().map(items, f)
 }
 
-fn chunks<T>(mut input: Vec<T>, chunk_size: usize) -> Vec<Vec<T>> {
-    let mut result = Vec::new();
-
-    while !input.is_empty() {
-        let chunk = input.drain(0..min(chunk_size, input.len())).collect();
-
-        result.push(chunk);
-    }
-
-    result
-}
-
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -117,6 +127,24 @@ mod tests {
         let result = parallel_map(data, f);
 
         assert_eq!(result.unwrap(), vec![2, 4, 6]);
+    }
+
+    #[test]
+    fn sleep() {
+        let data = vec![
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+            Duration::from_millis(400),
+            Duration::from_millis(300),
+        ];
+
+        let f = |x| std::thread::sleep(x);
+
+        ParallelMapper::new()
+            .with_threshold(0)
+            .with_concurrency(4)
+            .map(data, f)
+            .unwrap();
     }
 
     #[test]
